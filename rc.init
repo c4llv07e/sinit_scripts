@@ -1,0 +1,54 @@
+#!/bin/sh
+
+mount -o remount,rw /
+
+[ ! -e /dev/fd ] && ln -Ts /proc/self/fd /dev/fd
+
+rm -rf /var/tmp
+mkdir -p /var/tmp
+chmod 0777 /var/tmp
+mkdir -p /run/lock
+
+exec >>/var/log/global 2>&1
+
+echo "System loading at $(idate)"
+
+loadkeys -q -u /usr/share/mymap.map.gz & # kbd package
+echo 1 >| /sys/kernel/mm/ksm/run
+
+ip link set up dev lo
+# sysctl -p /etc/sysctl.conf >/dev/null
+
+case "${HOSTNAME}" in
+	"monoid")
+		mount -t ext4 -o remount,lazytime,nodiratime,noatime,commit=300 /dev/sdb2 /
+		mount -t btrfs -o compress=zstd:3,lazytime,nodiratime,noatime,discard=async,commit=300,autodefrag /dev/sda1 /home
+		setfont spleen-8x16 & # kbd package
+		mkdir -p /sys/block/zram0/
+		echo 8G >| /sys/block/zram0/disksize
+		mkswap --label zram0 /dev/zram0
+		swapon --priority 100 /dev/zram0
+		;;
+	"functor")
+		mount -t btrfs \
+			-o remount,relatime,noatime,commit=6000,compress=zstd \
+			/dev/sda3 / &
+		swapon -o noatime /dev/sda2 &
+		setfont ter-u18b &
+		tlp init start >/dev/null 2>&1 &
+		powertop --auto-tune >/dev/null 2>&1 &
+		for i in /sys/class/scsi_host/host*/link_power_management_policy; do echo min_power >| ${i}; done &
+		for i in /sys/bus/usb/devices/*/power/level; do echo auto >| ${i}; done &
+		;;
+esac
+
+hwclock --hctosys
+/usr/bin/sshd &
+seatd -g _seatd &
+ethtool -s eth wol g &
+
+mount -t cgroup2 cgroup2 /sys/fs/cgroup &
+
+setsid sh -c 'while true; do oksh -i -l <> /dev/tty3 >&0 2>&1; done' & # setsid - util-linux
+setsid sh -c 'while true; do oksh -i -l <> /dev/tty2 >&0 2>&1; done' &
+exec oksh -i -l -c 'wlroots_run.sh sway; oksh' > /dev/tty1 2>&1

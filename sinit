@@ -1,0 +1,215 @@
+#!/bin/tcc -run
+/*
+  MIT/X Consortium License
+
+  (c) 2014-2015 Dimitris Papastamos <sin@2f30.org>
+  (c) 2024-2025 c4llv07e <igor@c4llv07e.xyz>
+
+  Permission is hereby granted, free of charge, to any person obtaining a
+  copy of this software and associated documentation files (the "Software"),
+  to deal in the Software without restriction, including without limitation
+  the rights to use, copy, modify, merge, publish, distribute, sublicense,
+  and/or sell copies of the Software, and to permit persons to whom the
+  Software is furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+  THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+  DEALINGS IN THE SOFTWARE.
+*/
+
+#include <fcntl.h>
+#include <sys/mount.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <limits.h>
+
+#define LEN(x) (sizeof (x) / sizeof *(x))
+#define IOC(x) {(x), (sizeof (x))}
+#define IOV(x) {(x), cstrlen(x)}
+#define TIMEO 30
+
+static void sigpoweroff(void);
+static void sigreap(void);
+static void sigreboot(void);
+static void sigreload(void);
+static void spawn(char *const []);
+static int write_cstr(int, char *);
+static size_t cstrlen(char *);
+static void try_mount(char *, char *, char *, unsigned long, void *);
+
+static struct {
+	int sig;
+	void (*handler)(void);
+} sigmap[] = {
+	{ SIGUSR1, sigpoweroff },
+	{ SIGUSR2, sigreload   },
+	{ SIGCHLD, sigreap     },
+	{ SIGALRM, sigreap     },
+	{ SIGINT,  sigreboot   },
+};
+
+static sigset_t set;
+
+static size_t cstrlen(char *cstr) {
+	size_t n;
+	for (n = 0; cstr[n] != '\0'; ++n);
+	return n;
+}
+
+static int write_cstr(int fd, char *cstr) {
+	return write(fd, cstr, cstrlen(cstr));
+}
+
+static void try_mount(char *source, char *target, char *fstype,
+		unsigned long flags, void *data) {
+	if (mount(source, target, fstype, flags, data) != 0) {
+		writev(2, (struct iovec[]) {
+			IOC("can't mount \""),
+			IOV(source),
+			IOC("\" to \""),
+			IOV(target),
+			IOC("\"\n"),
+		}, 5);
+	}
+}
+
+static void virt_mount(char *source, char *target, char *fstype,
+		unsigned long flags, void *data) {
+	mkdir(target, 0640);
+	try_mount(source, target, fstype, flags, data);
+}
+
+static void setup_limits(void) {
+	struct rlimit rl;
+	rl.rlim_cur = rl.rlim_max = 524288;
+	if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+		write_cstr(2, "Error, can't set nofile limit\n");
+	}
+	rl.rlim_cur = rl.rlim_max = 65535;
+	if (setrlimit(RLIMIT_NPROC, &rl) != 0) {
+		write_cstr(2, "Error, can't set nproc limit\n");
+	}
+}
+
+static void resolve_hostname(void) {
+	char hostname[HOST_NAME_MAX] = {0};
+	int hostname_fd = 0;
+	ssize_t hostname_size = 0;
+	hostname_fd = open("proc/sys/kernel/hostname", O_RDONLY);
+	if (hostname_fd == -1) {
+		write_cstr(2, "Error, can't open hostname file\n");
+	} else {
+		hostname_size = read(hostname_fd, hostname, (sizeof hostname));
+		hostname[--hostname_size] = '\0';
+		if (hostname_size == -1) {
+			write_cstr(2, "Error, can't read hostname\n");
+		} else {
+			setenv("HOSTNAME", hostname, 1);
+		}
+		close(hostname_fd);
+	}
+}
+
+int main(void) {
+	int sig;
+	size_t i;
+	char *init_argv[] = { "/bin/rc.init", NULL };
+	char *mdevd_argv[] = { "/bin/mdevd", "-O", "4", NULL };
+	char *mdevd_coldplug_argv[] = { "/bin/mdevd-coldplug", NULL };
+
+	if (getpid() != 1)
+		return 1;
+	chdir("/");
+	sigfillset(&set);
+	sigprocmask(SIG_BLOCK, &set, NULL);
+	setenv("PATH", "/bin", 1);
+	setenv("HOME", "/", 1);
+	mount(NULL, "/", NULL, MS_REMOUNT, NULL);
+	virt_mount("proc", "/proc", "proc",
+		MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL);
+	virt_mount("sysfs", "/sys", "sysfs",
+		MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL);
+	virt_mount("run", "/run", "tmpfs",
+		MS_NOSUID | MS_NODEV, "mode=0775");
+	virt_mount("tmpfs", "/tmp", "tmpfs",
+		MS_NOSUID | MS_NODEV, "mode=0777");
+	virt_mount("devpts", "/dev/pts", "devpts",
+		0, "gid=5,mode=0620");
+	virt_mount("shm", "/dev/shm", "tmpfs",
+		MS_NOSUID | MS_NODEV, "mode=1777");
+	/*
+	virt_mount("securityfs", "/sys/kernel/security",
+		"securityfs", 0, NULL);
+	virt_mount("efivarfs", "/sys/firmware/efi/efivars", "efivarfs",
+		MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL);
+	*/
+	resolve_hostname();
+	setup_limits();
+
+	spawn(mdevd_argv);
+	spawn(mdevd_coldplug_argv);
+	spawn(init_argv);
+	while (1) {
+		alarm(TIMEO);
+		sigwait(&set, &sig);
+		for (i = 0; i < LEN(sigmap); i++) {
+			if (sigmap[i].sig == sig) {
+				sigmap[i].handler();
+				break;
+			}
+		}
+	}
+	/* not reachable */
+	return 0;
+}
+
+static void sigpoweroff(void) {
+	char *argv[] = { "/bin/rc.shutdown", "poweroff", NULL };
+	execvp(*argv, argv);
+}
+
+static void sigreap(void) {
+	while (waitpid(-1, NULL, WNOHANG) > 0);
+	alarm(TIMEO);
+}
+
+static void sigreboot(void) {
+	char *argv[] = { "/bin/rc.shutdown", "reboot", NULL };
+	execvp(*argv, argv);
+}
+
+static void sigreload(void) {
+	char *argv[] = { "/bin/rc.shutdown", "reload", NULL };
+	execvp(*argv, argv);
+}
+
+static void spawn(char *const argv[]) {
+	switch (fork()) {
+		case 0: {
+			sigprocmask(SIG_UNBLOCK, &set, NULL);
+			setsid();
+			execvp(argv[0], argv);
+			perror("execvp");
+			_exit(1);
+		} break;
+		case -1: {
+			perror("fork");
+		} break;
+	}
+}

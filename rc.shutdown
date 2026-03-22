@@ -1,0 +1,19 @@
+#!/bin/sh
+stty onlcr
+hwclock --systohc
+echo "e" >| /proc/sysrq-trigger
+sleep 1s
+echo "i" >| /proc/sysrq-trigger
+sync
+echo "s" >| /proc/sysrq-trigger
+echo "u" >| /proc/sysrq-trigger
+umount -af
+[ "${1}" = "reload" ] && {
+  umount /dev/pts;
+  umount /proc;
+  exec /bin/sinit;
+}
+sync
+[ "${1}" = "reboot" ] && echo "b" >| /proc/sysrq-trigger || \
+  echo "o" >| /proc/sysrq-trigger
+while true; do :; done
